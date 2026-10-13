@@ -442,6 +442,11 @@ function entBBox(e){
     case'arc':{const c=e.pts[0];return{minx:c.x-e.r,miny:c.y-e.r,maxx:c.x+e.r,maxy:c.y+e.r};}
     case'ellipse':{const c=e.pts[0];const m=Math.max(e.rx,e.ry);
       return{minx:c.x-m,miny:c.y-m,maxx:c.x+m,maxy:c.y+m};}
+    case'hatch':{if(!e.pts.length)return null;
+      let bb={minx:1e18,miny:1e18,maxx:-1e18,maxy:-1e18};
+      for(const p of e.pts){bb.minx=Math.min(bb.minx,p.x);bb.maxx=Math.max(bb.maxx,p.x);
+        bb.miny=Math.min(bb.miny,p.y);bb.maxy=Math.max(bb.maxy,p.y);}return bb;}
+    case'point':{const p=e.pts[0];return{minx:p.x,miny:p.y,maxx:p.x,maxy:p.y};}
     case'text':{const p=e.pts[0],w=textWidth(e);
       return{minx:p.x-w*.05,miny:p.y-e.size*.25,maxx:p.x+w*1.05,maxy:p.y+e.size};}
     case'dim':{const d=dimGeom(e);const pts=[e.pts[0],e.pts[1],d.A,d.B];let bb={minx:1e18,miny:1e18,maxx:-1e18,maxy:-1e18};
@@ -461,8 +466,18 @@ function entLength(e){
     case'arc':return e.r*(e.a1-e.a0);
     case'ellipse':{const a=e.rx,b=e.ry;return Math.PI*(3*(a+b)-Math.sqrt((3*a+b)*(a+3*b)));}
     case'dim':return dist(e.pts[0],e.pts[1]);
+    case'hatch':{let s=0,off=0;const rings=e.rings||[];
+      for(const cnt of rings){for(let i=0;i<cnt;i++)s+=dist(e.pts[off+i],e.pts[off+(i+1)%cnt]);off+=cnt;}return s;}
+    case'point':return 0;
   }return 0;}
 function entArea(e){
+  if(e.type==='hatch'){
+    const rings=e.rings||[];let off=0,best=0;
+    for(const cnt of rings){
+      let a=0;
+      for(let i=0;i<cnt;i++){const p=e.pts[off+i],q=e.pts[off+(i+1)%cnt];a+=p.x*q.y-q.x*p.y;}
+      a=Math.abs(a)/2;if(a>best)best=a;off+=cnt;}
+    return best;}
   const poly=e.type==='rect'?rectCorners(e):(e.type==='pline'&&e.closed?e.pts:null);
   if(!poly)return null;let s=0;
   for(let i=0;i<poly.length;i++){const p=poly[i],q=poly[(i+1)%poly.length];s+=p.x*q.y-q.x*p.y;}
@@ -492,6 +507,11 @@ function entHit(e,p,tol){
       return lx>=-w*.1&&lx<=w*1.05&&ly>=-e.size*.3&&ly<=e.size*1.05;}
     case'dim':{const d=dimGeom(e);
       return distPtSeg(p,e.pts[0],d.A)<tol||distPtSeg(p,e.pts[1],d.B)<tol||distPtSeg(p,d.A,d.B)<tol;}
+    case'hatch':{const rings=e.rings||[];let off=0;
+      for(const cnt of rings){for(let i=0;i<cnt;i++)
+        if(distPtSeg(p,e.pts[off+i],e.pts[off+(i+1)%cnt])<tol)return true;
+        off+=cnt;}return false;}
+    case'point':return dist(p,e.pts[0])<tol*1.5;
   }return false;}
 function hitTop(wp){const tol=7/view.scale;
   for(let i=doc.entities.length-1;i>=0;i--){const e=doc.entities[i];
@@ -552,6 +572,11 @@ function snapPts(e){
     case'ellipse':{const c=e.pts[0];P(c.x,c.y,'cen','圆心');break;}
     case'text':{P(e.pts[0].x,e.pts[0].y,'end','基点');break;}
     case'dim':{P(e.pts[0].x,e.pts[0].y,'end','标注点');P(e.pts[1].x,e.pts[1].y,'end','标注点');break;}
+    case'point':{P(e.pts[0].x,e.pts[0].y,'end','点');break;}
+    case'hatch':{const rings=e.rings||[];let off=0;
+      const tot=rings.reduce((a,b)=>a+b,0);
+      if(tot<=200)for(const cnt of rings){for(let i=0;i<cnt;i++){const p=e.pts[off+i];P(p.x,p.y,'end','角点');}off+=cnt;}
+      break;}
   }return out;}
 function findSnap(wp){
   if(!settings.osnap)return null;
@@ -631,6 +656,11 @@ function drawEnt(g,e,scale,color,alpha,wpx){
       g.fillStyle=color;g.globalAlpha=alpha;g.font=e.size+'px '+FONT;
       g.textBaseline='alphabetic';g.fillText(e.text,0,0);g.restore();break;}
     case'dim':drawDim(g,e,scale,color,alpha);break;
+    case'point':{const p=e.pts[0],r=4/(scale||1);
+      setStroke(g,color,alpha,scale,wpx);g.beginPath();
+      g.moveTo(p.x-r,p.y);g.lineTo(p.x+r,p.y);
+      g.moveTo(p.x,p.y-r);g.lineTo(p.x,p.y+r);g.stroke();break;}
+    case'hatch':drawHatch(g,e,scale,color,alpha);break;
   }
   g.globalAlpha=1;}
 
@@ -654,6 +684,43 @@ function drawDim(g,e,scale,color,alpha){
   g.save();g.translate(mx,my);g.scale(1,-1);g.rotate(-ang);
   g.font=ts+'px '+FONT;g.textAlign='center';g.fillText(fmt(d.L),0,0);
   g.textAlign='left';g.restore();g.globalAlpha=1;}
+
+/* ---------- 图案填充 ---------- */
+function hatchPath(g,e){
+  const rings=e.rings||[];let off=0,any=false;
+  g.beginPath();
+  for(const cnt of rings){
+    if(cnt<2){off+=cnt;continue;}
+    any=true;
+    const p0=e.pts[off];g.moveTo(p0.x,p0.y);
+    for(let i=1;i<cnt;i++){const p=e.pts[off+i];g.lineTo(p.x,p.y);}
+    g.closePath();off+=cnt;}
+  return any;}
+function drawHatch(g,e,scale,color,alpha){
+  alpha=alpha===undefined?1:alpha;
+  const bb=entBBox(e)||{minx:0,miny:0,maxx:0,maxy:0};
+  if(hatchPath(g,e)){
+    if(e.solid){g.fillStyle=color;g.globalAlpha=alpha*0.30;g.fill('evenodd');g.globalAlpha=1;}
+    else{
+      const pat=e.pat||{ang:-Math.PI/4,sp:20};
+      const ang=pat.ang||0,sp=Math.max(1e-6,pat.sp||20);
+      const dx=Math.cos(ang),dy=Math.sin(ang),nx=-dy,ny=dx;
+      const cs=[{x:bb.minx,y:bb.miny},{x:bb.maxx,y:bb.miny},{x:bb.maxx,y:bb.maxy},{x:bb.minx,y:bb.maxy}];
+      let cmin=1e18,cmax=-1e18,tmin=1e18,tmax=-1e18;
+      for(const p of cs){const cc=p.x*nx+p.y*ny,t=p.x*dx+p.y*dy;
+        if(cc<cmin)cmin=cc;if(cc>cmax)cmax=cc;
+        if(t<tmin)tmin=t;if(t>tmax)tmax=t;}
+      g.save();
+      hatchPath(g,e);g.clip('evenodd');
+      setStroke(g,color,alpha*0.5,scale,0.7);
+      g.beginPath();
+      const start=Math.ceil(cmin/sp)*sp;let guard=0;
+      for(let cc=start;cc<=cmax&&guard<3000;cc+=sp,guard++){
+        g.moveTo(nx*cc+dx*tmin,ny*cc+dy*tmin);
+        g.lineTo(nx*cc+dx*tmax,ny*cc+dy*tmax);}
+      g.stroke();g.restore();}
+    if(hatchPath(g,e)){setStroke(g,color,alpha*0.8,scale);g.stroke();}}
+  g.globalAlpha=1;}
 
 function drawDraft(){
   const a=draft.pts[draft.pts.length-1];
@@ -764,6 +831,7 @@ function gripsOf(e){
     A({x:c.x,y:c.y},'pt',0);
     A({x:c.x+e.rx*Math.cos(r),y:c.y+e.rx*Math.sin(r)},'rx',0);
     A({x:c.x-e.ry*Math.sin(r),y:c.y+e.ry*Math.cos(r)},'ry',0);}
+  else if(e.type==='point')e.pts.forEach((p,i)=>A({x:p.x,y:p.y},'pt',i));
   else if(e.type==='dim'){const d=dimGeom(e);
     e.pts.forEach((p,i)=>A({x:p.x,y:p.y},'pt',i));
     A({x:(d.A.x+d.B.x)/2,y:(d.A.y+d.B.y)/2},'off',-1);}
@@ -1290,13 +1358,21 @@ function renderProps(){
     case'dim':{
       h+=ro('测量值',fmt(dist(e.pts[0],e.pts[1])))
         +num('偏移','off',fmt4(e.off||0))+num('字高','ts',fmt4(e.ts||settings.dimTs));break;}
+    case'hatch':{
+      h+=ro('环数',(e.rings||[]).length)+ro('顶点数',e.pts.length)
+        +ro('类型',e.solid?'实心填充':'图案填充')+ro('周长',fmt(entLength(e)));
+      const a=entArea(e);if(a!==null)h+=ro('最大环面积',fmt(a));
+      break;}
+    case'point':{
+      const p=e.pts[0];
+      h+=ro('X',fmt4(p.x))+ro('Y',fmt4(p.y));break;}
   }
   h+=ops;
   box.innerHTML=h;
   bindProps(box,true);}
 
 function fmt4(v){return String(Math.round(v*10000)/10000);}
-function typeName(t){return({line:'直线',pline:'多段线',rect:'矩形',circle:'圆',arc:'圆弧',ellipse:'椭圆',text:'文字',dim:'标注'})[t]||t;}
+function typeName(t){return({line:'直线',pline:'多段线',rect:'矩形',circle:'圆',arc:'圆弧',ellipse:'椭圆',text:'文字',dim:'标注',hatch:'图案填充',point:'点'})[t]||t;}
 
 function bindProps(box,isEnt){
   box.querySelectorAll('input,select').forEach(inp=>{
@@ -1417,6 +1493,16 @@ function exportSVG(){
           s+='<path d="M '+F(sx)+' '+F(-sy)+' A '+F(e.r)+' '+F(e.r)+' 0 '+laf+' 0 '+F(ex)+' '+F(-ey)+'"/>\n';break;}
         case'ellipse':s+='<ellipse cx="'+F(e.pts[0].x)+'" cy="'+F(-e.pts[0].y)+'" rx="'+F(e.rx)+'" ry="'+F(e.ry)+'" transform="rotate('+F(-(e.rot||0)*R2D)+' '+F(e.pts[0].x)+' '+F(-e.pts[0].y)+')"/>\n';break;
         case'text':s+='<text x="0" y="0" transform="translate('+F(e.pts[0].x)+','+F(-e.pts[0].y)+') rotate('+F(-(e.rot||0)*R2D)+')" font-size="'+F(e.size)+'" fill="'+color+'" stroke="none">'+esc(e.text)+'</text>\n';break;
+        case'point':{const p=e.pts[0],rr=sw*2;
+          s+='<path d="M '+F(p.x-rr)+' '+F(-p.y)+' L '+F(p.x+rr)+' '+F(-p.y)+' M '+F(p.x)+' '+F(-(p.y-rr))+' L '+F(p.x)+' '+F(-(p.y+rr))+'"/>\n';break;}
+        case'hatch':{
+          let hd='',hoff=0;
+          for(const cnt of e.rings||[]){if(cnt<2){hoff+=cnt;continue;}
+            hd+='M '+F(e.pts[hoff].x)+' '+F(-e.pts[hoff].y)+' ';
+            for(let i=1;i<cnt;i++)hd+='L '+F(e.pts[hoff+i].x)+' '+F(-e.pts[hoff+i].y)+' ';
+            hd+='Z ';hoff+=cnt;}
+          if(e.solid)s+='<path d="'+hd+'" fill="'+color+'" fill-opacity="0.3" stroke="none"/>\n';
+          s+='<path d="'+hd+'" fill="none"/>\n';break;}
         case'dim':{const d=dimGeom(e),ts=e.ts||settings.dimTs,ext=0.35*ts;
           const L2=(a,b)=>'<line x1="'+F(a.x)+'" y1="'+F(-a.y)+'" x2="'+F(b.x)+'" y2="'+F(-b.y)+'"/>\n';
           s+=L2(e.pts[0],{x:d.A.x+d.nx*ext,y:d.A.y+d.ny*ext});
@@ -1479,6 +1565,14 @@ function exportDXF(){
         for(const p of pts){put(0,'VERTEX');put(8,lay);
           put(10,f(p.x));put(20,f(p.y));}
         put(0,'SEQEND');break;}
+      case'point':put(0,'POINT');put(8,lay);put(10,f(e.pts[0].x));put(20,f(e.pts[0].y));break;
+      case'hatch':{let off=0;
+        for(const cnt of e.rings||[]){if(cnt<2){off+=cnt;continue;}
+          put(0,'POLYLINE');put(8,lay);put(66,1);put(70,1);
+          for(let i=0;i<cnt;i++){put(0,'VERTEX');put(8,lay);
+            put(10,f(e.pts[off+i].x));put(20,f(e.pts[off+i].y));}
+          put(0,'SEQEND');off+=cnt;}
+        break;}
       case'dim':{const d=dimGeom(e),ts=e.ts||settings.dimTs,ext=0.35*ts;
         const line=(a,b)=>{put(0,'LINE');put(8,lay);
           put(10,f(a.x));put(20,f(a.y));put(11,f(b.x));put(21,f(b.y));};
@@ -1715,21 +1809,36 @@ function arcPoints(x1,y1,rx,ry,phiDeg,laf,sf,x2,y2){
 /* ---------- DXF 导入 ---------- */
 function importDXF(text,name){
   const res=parseDXF(text);
-  if(!res.ents.length)throw new Error('未解析出可导入的实体（支持 LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/TEXT/MTEXT/ELLIPSE/SPLINE）');
+  if(!res.ents.length)throw new Error('未解析出可导入的实体（LINE/CIRCLE/ARC/LWPOLYLINE/POLYLINE/TEXT/MTEXT/ELLIPSE/SPLINE/INSERT 块/DIMENSION 标注/SOLID/HATCH 边界）');
   pushHistory();
   for(const d of res.layerDefs)ensureLayer(d.name,ACI2C[d.color]||null);
+  // 图案填充补默认参数（无图案定义时按图幅估算间距）
+  {
+    const bb=allBBox(res.ents);
+    const diag=bb?Math.hypot(bb.maxx-bb.minx,bb.maxy-bb.miny):200;
+    const defSp=Math.max(1e-6,(diag||200)/50);
+    for(const e of res.ents)if(e.type==='hatch'&&!e.solid){
+      if(!e.pat)e.pat={ang:-Math.PI/4,sp:defSp};
+      if(!(e.pat.sp>0))e.pat.sp=defSp;
+      if(!isFinite(e.pat.ang))e.pat.ang=-Math.PI/4;}}
   for(const e of res.ents){e.id='E'+(doc.seq++);ensureLayer(e.layer);doc.entities.push(e);}
   filename=name||filename;
   refreshAll();fitView();
-  toast('已导入 DXF：'+res.ents.length+' 个实体'+(res.skipped?'（忽略 '+res.skipped+' 个）':''));}
+  const ex=[];
+  if(res.dims)ex.push('标注 '+res.dims);
+  if(res.blockRefs)ex.push('块引用 '+res.blockRefs);
+  if(res.skipped)ex.push('忽略 '+res.skipped);
+  toast('已导入 DXF：'+res.ents.length+' 个实体'+(ex.length?'（'+ex.join('，')+'）':''));}
 
 function parseDXF(text){
-  const lines=text.split(/\r\n|\r|\n/);
   const tags=[];
-  for(let i=0;i+1<lines.length;i+=2){
-    const c=parseInt(lines[i],10);
-    if(!isNaN(c))tags.push([c,lines[i+1].trim()]);}
-  const res={ents:[],layerDefs:[],skipped:0};
+  {
+    const lines=text.split(/\r\n|\r|\n/);
+    for(let i=0;i+1<lines.length;i+=2){
+      const c=parseInt(lines[i],10);
+      if(!isNaN(c))tags.push([c,lines[i+1].trim()]);}
+  }
+  const res={ents:[],layerDefs:[],skipped:0,dims:0,blockRefs:0};
   // 图层表
   for(let i=0;i<tags.length;i++){
     if(tags[i][0]===0&&tags[i][1].toUpperCase()==='LAYER'){
@@ -1738,91 +1847,350 @@ function parseDXF(text){
         if(tags[j][0]===2)nm=tags[j][1];
         if(tags[j][0]===62)cl=parseInt(tags[j][1])||7;}
       if(nm)res.layerDefs.push({name:nm,color:cl});}}
-  // 实体
-  const inSec=t=>t[0]===2&&t[1].toUpperCase()==='ENTITIES';
-  let sec=false;
+  // 段范围
+  const secs={};
   for(let i=0;i<tags.length;i++){
-    const t=tags[i];
-    if(t[0]===0&&t[1].toUpperCase()==='SECTION'){sec=tags[i+1]&&inSec(tags[i+1]);continue;}
-    if(t[0]===0&&t[1].toUpperCase()==='ENDSEC'){sec=false;continue;}
-    if(!sec||t[0]!==0)continue;
-    const kind=t[1].toUpperCase();
-    const take=()=>{const o={};let j=i+1;
-      for(;j<tags.length&&tags[j][0]!==0;j++){
-        const c=tags[j][0],v=tags[j][1];
-        (o[c]=o[c]||[]).push(v);}
-      return{o,end:j};};
-    const num=(o,c,def)=>o[c]?parseFloat(o[c][0]):def;
-    if(kind==='LINE'){const{o}=take();
-      res.ents.push({type:'line',pts:[{x:num(o,10,0),y:num(o,20,0)},{x:num(o,11,0),y:num(o,21,0)}],
-        layer:(o[8]||['0'])[0]});i=skipTo(tags,i);}
-    else if(kind==='CIRCLE'){const{o}=take();
-      res.ents.push({type:'circle',pts:[{x:num(o,10,0),y:num(o,20,0)}],r:num(o,40,1),
-        layer:(o[8]||['0'])[0]});i=skipTo(tags,i);}
-    else if(kind==='ARC'){const{o}=take();
-      let a0=num(o,50,0)*D2R,a1=num(o,51,360)*D2R;
+    if(tags[i][0]===0&&tags[i][1].toUpperCase()==='SECTION'&&tags[i+1]&&tags[i+1][0]===2){
+      const nm=tags[i+1][1].toUpperCase();
+      let j=i+1;
+      while(j<tags.length&&!(tags[j][0]===0&&tags[j][1].toUpperCase()==='ENDSEC'))j++;
+      secs[nm]={from:i+2,to:j};
+      i=j-1;}}
+  const ctx={blocks:Object.create(null),skipped:0,dims:0,blockRefs:0,depth:0};
+  // BLOCKS 段：收集块定义（含嵌套 INSERT 描述，展开时递归）
+  if(secs.BLOCKS){
+    const {from,to}=secs.BLOCKS;
+    let i=from;
+    while(i<to){
+      if(tags[i][0]!==0){i++;continue;}
+      if(tags[i][1].toUpperCase()!=='BLOCK'){i++;continue;}
+      const head=collectTags(tags,i+1,to);
+      const name=String((head.o[2]||[''])[0]||'').trim().toUpperCase();
+      const base={x:parseFloat((head.o[10]||['0'])[0])||0,y:parseFloat((head.o[20]||['0'])[0])||0};
+      const items=[];
+      let j=head.end;
+      while(j<to){
+        if(tags[j][0]!==0){j++;continue;}
+        const kw=tags[j][1].toUpperCase();
+        if(kw==='ENDBLK'){j=collectTags(tags,j+1,to).end;break;}
+        if(kw==='BLOCK')break;
+        const ent=readEntity(tags,j,to);
+        if(!ent)break;
+        if(ent.kind!=='SEQEND'&&ent.kind!=='VERTEX'&&ent.kind!=='ATTRIB')items.push(ent);
+        j=ent.end;}
+      if(name&&name!=='*MODEL_SPACE'&&name!=='*PAPER_SPACE')ctx.blocks[name]={base,items};
+      i=j;}}
+  // ENTITIES 段
+  if(secs.ENTITIES){
+    const {from,to}=secs.ENTITIES;
+    let i=from;
+    while(i<to){
+      if(tags[i][0]!==0){i++;continue;}
+      const ent=readEntity(tags,i,to);
+      if(!ent){i++;continue;}
+      const out=entsFromDxf(ctx,ent.kind,ent.o,ent.seq);
+      for(const e of out)res.ents.push(e);
+      i=ent.end;}}
+  res.skipped=ctx.skipped;res.dims=ctx.dims;res.blockRefs=ctx.blockRefs;
+  return res;}
+
+/* ---------- DXF 解析辅助 ---------- */
+function collectTags(tags,i,to){
+  const o={},seq=[];let j=i;
+  for(;j<to&&tags[j][0]!==0;j++){
+    const c=tags[j][0],v=tags[j][1];
+    (o[c]=o[c]||[]).push(v);seq.push([c,v]);}
+  return{o,seq,end:j};}
+function readEntity(tags,i,to){
+  if(i>=to||tags[i][0]!==0)return null;
+  const kind=tags[i][1].toUpperCase();
+  const head=collectTags(tags,i+1,to);
+  let end=head.end;
+  if(kind==='POLYLINE'){
+    const verts=[];
+    while(end<to&&tags[end][0]===0&&tags[end][1].toUpperCase()==='VERTEX'){
+      const v=collectTags(tags,end+1,to);verts.push(v.o);end=v.end;}
+    if(end<to&&tags[end][0]===0&&tags[end][1].toUpperCase()==='SEQEND')end=collectTags(tags,end+1,to).end;
+    head.o.__verts=verts;}
+  else if(kind==='INSERT'){
+    const atts=[];
+    while(end<to&&tags[end][0]===0&&tags[end][1].toUpperCase()==='ATTRIB'){
+      const a=collectTags(tags,end+1,to);atts.push(a.o);end=a.end;}
+    if(end<to&&tags[end][0]===0&&tags[end][1].toUpperCase()==='SEQEND')end=collectTags(tags,end+1,to).end;
+    head.o.__attribs=atts;}
+  return{kind,o:head.o,seq:head.seq,end};}
+// 2D 仿射矩阵：x'=a*x+c*y+e，y'=b*x+d*y+f
+function tfTranslate(dx,dy){return{a:1,b:0,c:0,d:1,e:dx,f:dy};}
+function tfPoint(m,p){return{x:m.a*p.x+m.c*p.y+m.e,y:m.b*p.x+m.d*p.y+m.f};}
+function tfMul(m1,m2){ // 先应用 m1，再应用 m2
+  return{a:m2.a*m1.a+m2.c*m1.b,b:m2.b*m1.a+m2.d*m1.b,
+    c:m2.a*m1.c+m2.c*m1.d,d:m2.b*m1.c+m2.d*m1.d,
+    e:m2.a*m1.e+m2.c*m1.f+m2.e,f:m2.b*m1.e+m2.d*m1.f+m2.f};}
+function tfEnt(e,m){
+  const s=Math.hypot(m.a,m.b),s2=Math.hypot(m.c,m.d);
+  const rot=Math.atan2(m.b,m.a);
+  const iso=Math.abs(s-s2)<=1e-9*Math.max(1,Math.abs(s));
+  const P=p=>tfPoint(m,p);
+  switch(e.type){
+    case'line':case'pline':case'rect':return{...e,pts:e.pts.map(P)};
+    case'circle':{const c=P(e.pts[0]);
+      if(iso)return{...e,pts:[c],r:e.r*s};
+      return{type:'ellipse',pts:[c],rx:e.r*s,ry:e.r*s2,rot,layer:e.layer};}
+    case'arc':{const c=P(e.pts[0]);
+      if(iso)return{...e,pts:[c],r:e.r*s,a0:e.a0+rot,a1:e.a1+rot};
+      const pts=[],n=Math.max(8,Math.ceil((e.a1-e.a0)/0.15));
+      for(let i=0;i<=n;i++){const t=e.a0+(e.a1-e.a0)*i/n;
+        pts.push(P({x:e.pts[0].x+e.r*Math.cos(t),y:e.pts[0].y+e.r*Math.sin(t)}));}
+      return{type:'pline',pts,closed:false,layer:e.layer};}
+    case'ellipse':{const c=P(e.pts[0]);
+      return{...e,pts:[c],rx:e.rx*s,ry:e.ry*s2,rot:(e.rot||0)+rot};}
+    case'text':{const p=P(e.pts[0]);
+      return{...e,pts:[p],size:e.size*s,rot:(e.rot||0)+rot};}
+    case'dim':{const p1=P(e.pts[0]),p2=P(e.pts[1]);
+      return{...e,pts:[p1,p2],off:(e.off||0)*s};}
+  }
+  return null;}
+function dxfLayer(o){const a=o[8];return a&&a.length?a[0]:'0';}
+function insertMatrix(o,dx,dy){
+  const rd=(c,d)=>{const a=o[c];const v=a&&a.length?parseFloat(a[0]):NaN;return isNaN(v)?d:v;};
+  const sx=rd(41,1),sy=rd(42,1),rot=rd(50,0)*D2R;
+  const ix=rd(10,0)+(dx||0),iy=rd(20,0)+(dy||0);
+  let m=tfTranslate(0,0);
+  m=tfMul(m,{a:sx,b:0,c:0,d:sy,e:0,f:0});
+  m=tfMul(m,{a:Math.cos(rot),b:Math.sin(rot),c:-Math.sin(rot),d:Math.cos(rot),e:0,f:0});
+  m=tfMul(m,tfTranslate(ix,iy));
+  return m;}
+// 展开块：W 为「块局部坐标 -> 世界坐标」矩阵
+function expandBlock(ctx,name,W,out,layerOverride){
+  const blk=ctx.blocks[name];
+  if(!blk)return;
+  for(const it of blk.items){
+    if(it.kind==='INSERT'){
+      const cname=String((it.o[2]||[''])[0]||'').trim().toUpperCase();
+      const cblk=ctx.blocks[cname];
+      if(!cblk||ctx.depth>6){ctx.skipped++;continue;}
+      const Ml=tfMul(tfTranslate(-cblk.base.x,-cblk.base.y),insertMatrix(it.o,0,0));
+      const Wc=tfMul(Ml,W);
+      const cl=dxfLayer(it.o);
+      ctx.depth++;
+      try{expandBlock(ctx,cname,Wc,out,cl&&cl!=='0'?cl:layerOverride);}finally{ctx.depth--;}
+      continue;}
+    if(it.kind==='ATTDEF')continue; // 属性定义由 ATTRIB 实例替代显示
+    let es=[];
+    try{es=entsFromDxf(ctx,it.kind,it.o,it.seq);}catch(err){es=[];}
+    for(const e of es){
+      const te=tfEnt(e,W);
+      if(!te)continue;
+      if(layerOverride&&(!te.layer||te.layer==='0'))te.layer=layerOverride;
+      out.push(te);}}
+}
+function entsFromDxf(ctx,kind,o,seq){
+  const num=(c,d)=>{const a=o[c];if(!a||!a.length)return d;const v=parseFloat(a[0]);return isNaN(v)?d:v;};
+  const str=c=>{const a=o[c];return a&&a.length?a[0]:'';};
+  const layer=dxfLayer(o);
+  const P=(c1,c2)=>({x:num(c1,0),y:num(c2,0)});
+  switch(kind){
+    case'LINE':return[{type:'line',pts:[P(10,20),P(11,21)],layer}];
+    case'CIRCLE':return[{type:'circle',pts:[P(10,20)],r:num(40,1),layer}];
+    case'ARC':{let a0=num(50,0)*D2R,a1=num(51,360)*D2R;
       while(a1<=a0)a1+=2*Math.PI;
-      res.ents.push({type:'arc',pts:[{x:num(o,10,0),y:num(o,20,0)}],r:num(o,40,1),a0,a1,
-        layer:(o[8]||['0'])[0]});i=skipTo(tags,i);}
-    else if(kind==='TEXT'||kind==='MTEXT'){const{o}=take();
+      return[{type:'arc',pts:[P(10,20)],r:num(40,1),a0,a1,layer}];}
+    case'TEXT':case'MTEXT':{
       let txt=kind==='MTEXT'?(o[3]||[]).join('')+(o[1]||[''])[0]:(o[1]||[''])[0];
       txt=dxfText(txt);
-      if(txt)res.ents.push({type:'text',pts:[{x:num(o,10,0),y:num(o,20,0)}],
-        text:txt,size:Math.max(1,num(o,40,10)),rot:num(o,50,0)*D2R,
-        layer:(o[8]||['0'])[0]});
-      i=skipTo(tags,i);}
-    else if(kind==='LWPOLYLINE'){const{o}=take();
+      if(!txt)return[];
+      return[{type:'text',pts:[P(10,20)],text:txt,size:Math.max(1,num(40,10)),rot:num(50,0)*D2R,layer}];}
+    case'LWPOLYLINE':{
       const xs=o[10]||[],ys=o[20]||[],bs=(o[42]||[]).map(Number);
-      const pts=[],raw=[];
+      const raw=[];
       for(let j=0;j<Math.min(xs.length,ys.length);j++)
         raw.push({x:parseFloat(xs[j]),y:parseFloat(ys[j]),b:bs[j]||0});
-      expandBulges(raw,pts);
-      if(pts.length>=2)res.ents.push({type:'pline',pts,closed:!!(parseInt(o[70]||['0'])[0]&1),
-        layer:(o[8]||['0'])[0]});
-      i=skipTo(tags,i);}
-    else if(kind==='POLYLINE'){let flag=0,raw=[],lay='0';let j=i+1;
-      for(;j<tags.length&&tags[j][0]!==0;j++){
-        if(tags[j][0]===8)lay=tags[j][1];
-        if(tags[j][0]===70)flag|=(parseInt(tags[j][1])||0);}
-      while(j<tags.length&&tags[j][0]===0&&tags[j][1].toUpperCase()==='VERTEX'){
-        const vo={};let k=j+1;
-        for(;k<tags.length&&tags[k][0]!==0;k++){(vo[tags[k][0]]=vo[tags[k][0]]||[]).push(tags[k][1]);}
-        raw.push({x:num(vo,10,0),y:num(vo,20,0),b:num(vo,42,0)});
-        j=k;}
       const pts=[];expandBulges(raw,pts);
-      if(pts.length>=2)res.ents.push({type:'pline',pts,closed:!!(flag&1),layer:lay});
-      i=Math.max(i,j-1);}
-    else if(kind==='ELLIPSE'){const{o}=take();
-      const c={x:num(o,10,0),y:num(o,20,0)};
-      const mx=num(o,11,1),my=num(o,21,0);
-      const rx=Math.hypot(mx,my),rot=Math.atan2(my,mx);
-      const ratio=num(o,40,1);
-      const p0=num(o,41,0),p1=num(o,42,2*Math.PI);
-      if(p1-p0<2*Math.PI-1e-6){
+      if(pts.length<2)return[];
+      return[{type:'pline',pts,closed:!!(parseInt(str(70)||'0',10)&1),layer}];}
+    case'POLYLINE':{
+      const flag=parseInt(str(70)||'0',10)||0,raw=[];
+      for(const vo of (o.__verts||[])){
+        const g=c=>{const a=vo[c];const v=a&&a.length?parseFloat(a[0]):0;return isNaN(v)?0:v;};
+        raw.push({x:g(10),y:g(20),b:g(42)});}
+      const pts=[];expandBulges(raw,pts);
+      if(pts.length<2)return[];
+      return[{type:'pline',pts,closed:!!(flag&1),layer}];}
+    case'ELLIPSE':{
+      const c=P(10,20),mx=num(11,1),my=num(21,0);
+      const rx=Math.hypot(mx,my),rot=Math.atan2(my,mx),ratio=num(40,1);
+      const a0=num(41,0),a1=num(42,2*Math.PI);
+      if(a1-a0<2*Math.PI-1e-6){
         const pts=[];
-        for(let t=p0;t<=p1+1e-9;t+=(p1-p0)/24)
+        for(let t=a0;t<=a1+1e-9;t+=(a1-a0)/24)
           pts.push({x:c.x+rx*Math.cos(t),y:c.y+rx*ratio*Math.sin(t)});
-        res.ents.push({type:'pline',pts,closed:false,layer:(o[8]||['0'])[0]});}
-      else res.ents.push({type:'ellipse',pts:[c],rx,ry:rx*ratio,rot,
-        layer:(o[8]||['0'])[0]});
-      i=skipTo(tags,i);}
-    else if(kind==='SPLINE'){const{o}=take();
-      let raw=(o[11]&&o[11].length?{x:o[11],y:o[21]}:{x:o[10]||[],y:o[20]||[]});
+        return[{type:'pline',pts,closed:false,layer}];}
+      return[{type:'ellipse',pts:[c],rx,ry:rx*ratio,rot,layer}];}
+    case'SPLINE':{
+      const useFit=!!(o[11]&&o[11].length);
+      const xs=useFit?o[11]:(o[10]||[]),ys=useFit?o[21]:(o[20]||[]);
       const ctrl=[];
-      for(let j=0;j<Math.min(raw.x.length,raw.y.length);j++)
-        ctrl.push({x:parseFloat(raw.x[j]),y:parseFloat(raw.y[j])});
-      const closed=!!(parseInt(o[70]||['0'])[0]&1);
-      if(ctrl.length>=2){
-        const pts=catmull(ctrl,closed,8);
-        res.ents.push({type:'pline',pts:pts.map(p=>({x:p.x,y:p.y})),closed,layer:(o[8]||['0'])[0]});}
-      i=skipTo(tags,i);}
-    else if(['POINT','INSERT','DIMENSION','HATCH','SOLID','3DFACE','VIEWPORT','ATTDEF','ATTRIB'].includes(kind)){
-      res.skipped++;i=skipTo(tags,i);}
+      for(let j=0;j<Math.min(xs.length,ys.length);j++)ctrl.push({x:parseFloat(xs[j]),y:parseFloat(ys[j])});
+      const closed=!!(parseInt(str(70)||'0',10)&1);
+      if(ctrl.length<2)return[];
+      const pts=catmull(ctrl,closed,8);
+      return[{type:'pline',pts:pts.map(q=>({x:q.x,y:q.y})),closed,layer}];}
+    case'SOLID':case'3DFACE':{
+      const A=P(10,20),B=P(11,21),C=P(12,22),D=P(13,23);
+      const pts=kind==='SOLID'?[A,B,D,C]:[A,B,C,D];
+      const uq=[];
+      for(const q of pts)if(!uq.length||Math.hypot(q.x-uq[uq.length-1].x,q.y-uq[uq.length-1].y)>1e-9)uq.push(q);
+      if(uq.length>1&&Math.hypot(uq[0].x-uq[uq.length-1].x,uq[0].y-uq[uq.length-1].y)<1e-9)uq.pop();
+      if(uq.length<3)return[];
+      return[{type:'pline',pts:uq,closed:true,layer}];}
+    case'INSERT':{
+      const name=str(2).trim().toUpperCase();
+      const blk=ctx.blocks[name];
+      if(!blk||ctx.depth>6){ctx.skipped++;return[];}
+      const cols=Math.max(1,parseInt(str(70)||'1',10)||1);
+      const rows=Math.max(1,parseInt(str(71)||'1',10)||1);
+      const dcol=num(44,0),drow=num(45,0);
+      const out=[];let W0=null;
+      for(let r=0;r<rows;r++)for(let c=0;c<cols;c++){
+        const W=tfMul(tfTranslate(-blk.base.x,-blk.base.y),insertMatrix(o,c*dcol,r*drow));
+        if(!W0)W0=W;
+        ctx.depth++;
+        try{expandBlock(ctx,name,W,out,layer);}finally{ctx.depth--;}
+        ctx.blockRefs++;}
+      if(W0)for(const ao of (o.__attribs||[])){
+        const txt=dxfText((ao[1]||[''])[0]||'');
+        if(!txt)continue;
+        const te=tfEnt({type:'text',
+          pts:[{x:parseFloat((ao[10]||['0'])[0])||0,y:parseFloat((ao[20]||['0'])[0])||0}],
+          text:txt,size:Math.max(1,parseFloat((ao[40]||['10'])[0])||10),rot:0,layer:dxfLayer(ao)},W0);
+        if(te){if(layer&&(!te.layer||te.layer==='0'))te.layer=layer;out.push(te);}}
+      return out;}
+    case'DIMENSION':{
+      const type=parseInt(str(70)||'0',10)&7;
+      const d1=o[13]?{x:num(13,0),y:num(23,0)}:null;
+      const d2=o[14]?{x:num(14,0),y:num(24,0)}:null;
+      const bn=str(2).trim().toUpperCase();
+      const blk=ctx.blocks[bn];
+      let ts=0;
+      if(blk)for(const it of blk.items){
+        if(it.kind==='TEXT'||it.kind==='MTEXT'){
+          const h=parseFloat((it.o[40]||['0'])[0])||0;
+          if(h>ts)ts=h;}}
+      if((type===0||type===1)&&d1&&d2){
+        const dx=d2.x-d1.x,dy=d2.y-d1.y,L=Math.hypot(dx,dy);
+        if(L>1e-9){
+          const ux=dx/L,uy=dy/L,nx=-uy,ny=ux;
+          const p10={x:num(10,0),y:num(20,0)};
+          const off=(p10.x-d1.x)*nx+(p10.y-d1.y)*ny;
+          const ent={type:'dim',pts:[d1,d2],off,layer};
+          if(ts>0)ent.ts=ts;
+          ctx.dims++;
+          return[ent];}}
+      if(blk&&ctx.depth<=6){
+        const out=[];
+        ctx.depth++;
+        try{expandBlock(ctx,bn,{a:1,b:0,c:0,d:1,e:0,f:0},out,layer);ctx.dims++;}finally{ctx.depth--;}
+        return out;}
+      ctx.skipped++;return[];}
+    case'HATCH':{
+      let hh=null;
+      try{hh=parseHatch(seq||[]);}catch(err){hh=null;}
+      if(!hh||!hh.rings.length){ctx.skipped++;return[];}
+      const hpts=[],hrings=[];
+      for(const r of hh.rings){hrings.push(r.length);for(const p of r)hpts.push({x:p.x,y:p.y});}
+      return[{type:'hatch',pts:hpts,rings:hrings,solid:!!hh.solid,
+        pat:hh.solid?null:{ang:hh.ang,sp:hh.sp},layer}];}
+    case'POINT':return[{type:'point',pts:[P(10,20)],layer}];
+    case'ATTDEF':{
+      const txt=dxfText(str(1)||'');
+      if(!txt)return[];
+      return[{type:'text',pts:[P(10,20)],text:txt,size:Math.max(1,num(40,10)),rot:num(50,0)*D2R,layer}];}
+    case'LEADER':{
+      const xs=o[10]||[],ys=o[20]||[],ps=[];
+      for(let j=0;j<Math.min(xs.length,ys.length);j++)ps.push({x:parseFloat(xs[j]),y:parseFloat(ys[j])});
+      if(ps.length<2)return[];
+      return[{type:'pline',pts:ps,closed:false,layer}];}
+    case'MLINE':{
+      const xs=o[11]||[],ys=o[21]||[],ps=[];
+      for(let j=0;j<Math.min(xs.length,ys.length);j++)ps.push({x:parseFloat(xs[j]),y:parseFloat(ys[j])});
+      if(ps.length<2)return[];
+      return[{type:'pline',pts:ps,closed:false,layer}];}
   }
-  return res;}
-function skipTo(tags,i){let j=i+1;
-  while(j<tags.length&&tags[j][0]!==0)j++;
-  return j-1;}
+  ctx.skipped++;return[];}
+function parseHatch(seq){
+  const rings=[];let i=0;const n=seq.length;
+  let nPath=0,solid=false,rapAng=0,pAng=0,pSp=0;
+  for(;i<n;i++){
+    const c=seq[i][0],v=seq[i][1];
+    if(c===70)solid=!!(parseInt(v,10)&1);
+    else if(c===52){const a=parseFloat(v);if(!isNaN(a))rapAng=a*D2R;}
+    else if(c===91){nPath=parseInt(v,10)||0;i++;break;}}
+  const isStop=c=>c===92||c===97;
+  for(let p=0;p<nPath&&i<n;p++){
+    if(seq[i][0]!==92)break;
+    const ptype=parseInt(seq[i][1],10)||0;i++;
+    if(ptype&2){
+      const raw=[];let cur=null;
+      while(i<n&&!isStop(seq[i][0])){
+        const c=seq[i][0],v=seq[i][1];
+        if(c===10){if(cur)raw.push(cur);cur={x:parseFloat(v),y:0,b:0};}
+        else if(c===20){if(cur)cur.y=parseFloat(v);}
+        else if(c===42){if(cur)cur.b=parseFloat(v)||0;}
+        i++;}
+      if(cur)raw.push(cur);
+      const pts=[];
+      try{expandBulges(raw,pts);}catch(err){}
+      if(pts.length>=3)rings.push(pts);
+    }else{
+      while(i<n&&seq[i][0]!==93&&!isStop(seq[i][0]))i++;
+      let nEdge=0;
+      if(i<n&&seq[i][0]===93){nEdge=parseInt(seq[i][1],10)||0;i++;}
+      const ring=[];
+      for(let e=0;e<nEdge&&i<n;e++){
+        while(i<n&&seq[i][0]!==72&&!isStop(seq[i][0]))i++;
+        if(i>=n||seq[i][0]!==72)break;
+        const etype=parseInt(seq[i][1],10)||0;i++;
+        if(etype===1){
+          let cur=null;
+          while(i<n&&seq[i][0]!==72&&!isStop(seq[i][0])){
+            const c=seq[i][0],v=seq[i][1];
+            if(c===10){cur={x:parseFloat(v),y:0};ring.push(cur);}
+            else if(c===20){if(cur)cur.y=parseFloat(v);}
+            else if(c===11){cur={x:parseFloat(v),y:0};ring.push(cur);}
+            else if(c===21){if(cur)cur.y=parseFloat(v);}
+            i++;}
+        }else if(etype===2){
+          let cx=0,cy=0,r=1,a0=0,a1=0,ccw=1;
+          while(i<n&&seq[i][0]!==72&&!isStop(seq[i][0])){
+            const c=seq[i][0],v=seq[i][1];
+            if(c===10)cx=parseFloat(v);else if(c===20)cy=parseFloat(v);
+            else if(c===40)r=parseFloat(v);else if(c===50)a0=parseFloat(v);
+            else if(c===51)a1=parseFloat(v);else if(c===73)ccw=parseInt(v,10)||0;
+            i++;}
+          a0*=D2R;a1*=D2R;
+          if(ccw){while(a1<=a0)a1+=2*Math.PI;}else{if(a1>=a0)a1-=2*Math.PI;}
+          const nn=Math.max(4,Math.ceil(Math.abs(a1-a0)/0.2));
+          for(let k=0;k<=nn;k++){const t=a0+(a1-a0)*k/nn;
+            ring.push({x:cx+r*Math.cos(t),y:cy+r*Math.sin(t)});}
+        }else{
+          while(i<n&&seq[i][0]!==72&&!isStop(seq[i][0]))i++;}
+      }
+      if(ring.length>=3)rings.push(ring);}
+    while(i<n&&seq[i][0]!==97&&seq[i][0]!==92)i++;
+    if(i<n&&seq[i][0]===97){i++;while(i<n&&seq[i][0]!==92)i++;}}
+  // 图案线定义：78 后第一组的 53（角度）与 45/46（偏移）
+  for(let k=0;k<n;k++){
+    if(seq[k][0]===78){
+      for(let j=k+1;j<n;j++){
+        if(seq[j][0]===53){const a=parseFloat(seq[j][1]);if(!isNaN(a))pAng=a*D2R;}
+        if(seq[j][0]===45){
+          const x=parseFloat(seq[j][1])||0;
+          const y=(seq[j+1]&&seq[j+1][0]===46)?(parseFloat(seq[j+1][1])||0):0;
+          const d=Math.hypot(x,y);if(d>0){pSp=d;break;}}
+        if(seq[j][0]===98)break;}
+      break;}}
+  if(!pAng)pAng=rapAng;
+  return{rings,solid,ang:pAng,sp:pSp};}
 function dxfText(s){
   return s.replace(/\\P/g,' ').replace(/\\[A-Za-z][^;\\]*;/g,'')
     .replace(/[{}]/g,'').replace(/%%d/gi,'°').replace(/%%c/gi,'⌀').replace(/%%p/gi,'±').trim();}
